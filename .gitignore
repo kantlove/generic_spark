@@ -2,3 +2,4 @@
 *.log
 target/
 spark-warehouse/
+.idea/

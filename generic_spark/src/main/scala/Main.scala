@@ -1,8 +1,11 @@
 package generic_spark
 
-import org.apache.spark.sql.Dataset
+import org.apache.spark.sql.{Dataset, Encoder}
 import shapeless._
+import shapeless.poly._
 import utils._
+
+import scala.reflect.runtime.universe._
 
 /**
   * Scenario:
@@ -19,7 +22,9 @@ trait HasAmount {
 }
 
 case class User(name: String)
+
 case class Txn(user_name: String, amount: Int) extends HasAmount
+
 case class Revenue(user_name: String, revenue: Int)
 
 object Main extends SparkLocal {
@@ -36,55 +41,56 @@ object Main extends SparkLocal {
 
     getUserRevenue(users, txns).show()
 
-    getUserRevenue2(users, txns).show()
-
     spark.stop()
   }
 
-  object getUserRevenue2 {
+  object getUserRevenue {
+
     object getKey extends Poly1 {
-      implicit val userCase: Case.Aux[User, String] = at((u: User) => u.name)
-      implicit val txnCase: Case.Aux[Txn, String] = at((t: Txn) => t.user_name)
+      implicit val caseUser: Case.Aux[User, Tuple1[String]] =
+        at(u => Tuple1(u.name))
+      implicit val caseTxn: Case.Aux[Txn, Tuple1[String]] =
+        at(t => Tuple1(t.user_name))
     }
 
-    def apply(users: Dataset[User], txns: Dataset[Txn]): Dataset[Revenue] =
+    def apply(users: Dataset[User], txns: Dataset[Txn]): Dataset[Revenue] = {
       getUserRevenueGeneric(users, txns, getKey) { (user, revenue) =>
         Revenue(user.name, revenue)
       }
+    }
   }
 
-  def getUserRevenueGeneric[U, T <: HasAmount, Out]
-  (users: Dataset[U], txns: Dataset[T], getKey: Poly)
-  (output: (U, Int) => Out)
-  : Dataset[Out] = {
+  def getUserRevenueGeneric[U <: Product, T <: Product with HasAmount, K <: Product, Out <: Product](
+    users: Dataset[U],
+    txns: Dataset[T],
+    getKey: Poly1
+  )(
+    output: (U, Int) => Out
+  )(implicit
+    // requires that `getKey` can handle `U` and `T`
+    caseU: Case.Aux[getKey.type, U :: HNil, K],
+    caseT: Case.Aux[getKey.type, T :: HNil, K],
+    // requirements from Spark API
+    e0: Encoder[K],
+    t0: TypeTag[U],
+    t1: TypeTag[T],
+    t2: TypeTag[Out],
+    t3: TypeTag[K]
+  ): Dataset[Out] = {
+
     users
-      .leftJoin(txns)(u => getKey(u), t => getKey(t)) // returns Dataset[(U, Option[T])]
+//      .joinWith[T](txns, $"name" === $"user_name", "left") // Dataset[(U, T)]
+      .leftJoin(txns)(u => getKey(u), t => getKey(t)) // Dataset[(U, T)]
+      .groupByKey { case (u, _) => getKey(u) }
+      .flatMapGroups {
+        case (_, iter) =>
+          val group = iter.toSeq
+          val _users = group.map(_._1)
+          val maybeTxns = group.map(_._2)
 
-      .groupByKey { case (u, t) => getKey(u) }
-      .flatMapGroups { case (_, iter) =>
-        val group = iter.toSeq
-        val _users = group.map(_._1)
-        val maybeTxns = group.map(_._2)
+          val revenue = maybeTxns.flatten.map(_.amount).sum
 
-        val revenue = maybeTxns.flatten.map(_.amount).sum
-
-        Seq(output(_users.head, revenue))
-      }
-  }
-
-  def getUserRevenue(users: Dataset[User], txns: Dataset[Txn]): Dataset[Revenue] = {
-    users
-      .leftJoin(txns)(_.name, _.user_name) // returns Dataset[(User, Option[Txn])]
-
-      .groupByKey { case (u, t) => (u.name) }
-      .flatMapGroups { case (_, iter) =>
-        val group = iter.toSeq
-        val _users = group.map(_._1)
-        val maybeTxns = group.map(_._2)
-
-        val revenue = maybeTxns.flatten.map(_.amount).sum
-
-        Seq(Revenue(_users.head.name, revenue))
+          Seq(output(_users.head, revenue))
       }
   }
 }
